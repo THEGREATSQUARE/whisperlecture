@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WhisperLecture - Transcribe</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>WhisperLecture</h1>
+    <p>Drag and drop an audio file below to transcribe. The result will download as a structured .txt file.</p>
+
+    <div id="dropzone" class="dropzone">
+      <span>Drop audio file here or click to select</span>
+      <input id="fileInput" type="file" accept="audio/*" />
+    </div>
+
+    <div id="progress" class="progress" style="display: none;">
+      <div class="progress-bar">
+        <div id="progress-fill" class="progress-fill"></div>
+      </div>
+      <div id="progress-text">Processing...</div>
+      <div id="progress-time">Estimating time...</div>
+    </div>
+
+    <div id="status" class="status"></div>
+  </div>
+
+  <script>
+    const dropzone = document.getElementById('dropzone');
+    const fileInput = document.getElementById('fileInput');
+    const status = document.getElementById('status');
+    const progress = document.getElementById('progress');
+    const progressFill = document.getElementById('progress-fill');
+    const progressText = document.getElementById('progress-text');
+    const progressTime = document.getElementById('progress-time');
+
+    function setStatus(text, cls = '') {
+      status.textContent = text;
+      status.className = 'status ' + cls;
+    }
+
+    function showProgress() {
+      progress.style.display = 'block';
+      progressFill.style.width = '0%';
+      progressText.textContent = 'Uploading and transcribing...';
+      progressTime.textContent = 'Estimating time...';
+    }
+
+    function updateProgress(percent, text, timeText) {
+      progressFill.style.width = percent + '%';
+      if (text) progressText.textContent = text;
+      if (timeText) progressTime.textContent = timeText;
+    }
+
+    function hideProgress() {
+      progress.style.display = 'none';
+    }
+
+    function formatFileSize(bytes) {
+      if (bytes === 0) return '0 Bytes';
+      const k = 1024;
+      const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    }
+
+    function estimateTime(fileSize) {
+      // Rough estimate: 1MB = ~30 seconds for transcription
+      const mb = fileSize / (1024 * 1024);
+      const seconds = Math.round(mb * 30);
+      if (seconds < 60) return `${seconds} seconds`;
+      const minutes = Math.round(seconds / 60);
+      return `${minutes} minutes`;
+    }
+
+    function upload(file) {
+      if (!file) return;
+      
+      const fileSize = file.size;
+      const sizeText = formatFileSize(fileSize);
+      const timeEstimate = estimateTime(fileSize);
+      
+      showProgress();
+      setStatus(`File: ${file.name} (${sizeText}) - Estimated time: ${timeEstimate}`, 'working');
+      
+      const form = new FormData();
+      form.append('file', file);
+
+      // Simulate progress for upload phase
+      let uploadProgress = 0;
+      const uploadInterval = setInterval(() => {
+        uploadProgress += Math.random() * 15;
+        if (uploadProgress > 90) uploadProgress = 90;
+        updateProgress(uploadProgress, 'Uploading...', `Estimated transcription time: ${timeEstimate}`);
+      }, 200);
+
+      fetch('/api/transcribe', {
+        method: 'POST',
+        body: form,
+      }).then(async (res) => {
+        clearInterval(uploadInterval);
+        updateProgress(95, 'Transcribing with Whisper...', 'Almost done...');
+        
+        if (!res.ok) {
+          const txt = await res.text();
+          throw new Error(txt || 'Server error');
+        }
+        return res.blob();
+      }).then((blob) => {
+        updateProgress(100, 'Downloading transcript...', 'Complete!');
+        
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        const name = (file.name.replace(/\.[^.]+$/, '') || 'transcript') + '_transcript.txt';
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        window.URL.revokeObjectURL(url);
+        
+        setStatus('Done. Transcript downloaded.', 'ok');
+        hideProgress();
+      }).catch((err) => {
+        clearInterval(uploadInterval);
+        console.error(err);
+        setStatus('Error: ' + err.message, 'error');
+        hideProgress();
+      });
+    }
+
+    dropzone.addEventListener('click', () => fileInput.click());
+
+    dropzone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      dropzone.classList.add('hover');
+    });
+
+    dropzone.addEventListener('dragleave', () => {
+      dropzone.classList.remove('hover');
+    });
+
+    dropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropzone.classList.remove('hover');
+      const file = e.dataTransfer.files[0];
+      upload(file);
+    });
+
+    fileInput.addEventListener('change', () => {
+      const file = fileInput.files[0];
+      upload(file);
+    });
+  </script>
+</body>
+</html>

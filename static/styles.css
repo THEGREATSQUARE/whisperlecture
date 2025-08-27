@@ -1,0 +1,15 @@
+.container{max-width:720px;margin:40px auto;padding:0 16px;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+h1{font-size:28px;margin:0 0 8px}
+p{color:#444}
+.dropzone{border:2px dashed #6b7280;border-radius:12px;padding:40px;text-align:center;color:#6b7280;cursor:pointer;position:relative}
+.dropzone.hover{border-color:#3b82f6;color:#3b82f6;background:#f0f7ff}
+.dropzone input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer}
+.progress{margin-top:20px}
+.progress-bar{width:100%;height:8px;background:#e5e7eb;border-radius:4px;overflow:hidden}
+.progress-fill{height:100%;background:#3b82f6;width:0%;transition:width 0.3s ease}
+.progress-text{margin-top:8px;font-weight:500;color:#374151}
+.progress-time{margin-top:4px;font-size:14px;color:#6b7280}
+.status{margin-top:16px}
+.status.ok{color:#16a34a}
+.status.error{color:#dc2626}
+.status.working{color:#2563eb}
