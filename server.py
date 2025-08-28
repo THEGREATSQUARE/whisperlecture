@@ -3,6 +3,7 @@ import os
 import tempfile
 import logging
 import shutil
+import time
 from pathlib import Path
 from typing import Tuple
 from datetime import datetime
@@ -29,10 +30,13 @@ client = OpenAI()
 
 # OpenAI Whisper API limits
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB
-CHUNK_DURATION = 10 * 60  # 10 minutes in seconds
+CHUNK_DURATION = 5 * 60  # 5 minutes in seconds
 
 # FFmpeg configuration - you can set this in your .env file
 FFMPEG_PATH = os.getenv('FFMPEG_PATH', 'ffmpeg')  # Default to 'ffmpeg' (PATH lookup)
+
+# Model for notes generation (configurable)
+CHATGPT_MODEL = os.getenv("CHATGPT_MODEL", "gpt-4o-mini")
 
 
 def check_ffmpeg_available() -> bool:
@@ -73,6 +77,29 @@ def get_ffmpeg_command() -> list[str]:
         return ['ffmpeg']
     else:
         return [FFMPEG_PATH]
+
+
+def convert_audio_to_mono_16k(input_path: Path) -> Path:
+    """Convert any audio to 16 kHz mono PCM using ffmpeg. Returns path to converted file."""
+    import subprocess
+    if not check_ffmpeg_available():
+        raise RuntimeError("FFmpeg not available for conversion")
+    out_path = Path(tempfile.mktemp(suffix="_mono16k.wav"))
+    ffmpeg_cmd = get_ffmpeg_command()
+    cmd = [
+        *ffmpeg_cmd,
+        '-y',
+        '-i', str(input_path),
+        '-ac', '1',            # mono
+        '-ar', '16000',        # 16 kHz sample rate
+        '-sample_fmt', 's16',  # 16-bit PCM
+        str(out_path)
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
+        raise RuntimeError(f"FFmpeg conversion failed: {result.stderr.decode(errors='ignore')}")
+    logger.info(f"Converted audio to mono 16 kHz: {out_path.name} ({out_path.stat().st_size/1024:.1f} KB)")
+    return out_path
 
 
 def log_request_info(file_size: int, filename: str):
@@ -144,6 +171,7 @@ def chunk_with_ffmpeg(input_path: Path, chunk_duration: int) -> tuple[list[Path]
             logger.info(f"Skipping chunk {i+1} - beyond audio duration")
             break
             
+        # Produce compressed chunks: mono, 16 kHz MP3 (much smaller than WAV)
         chunk_path = temp_dir / f"chunk_{i:03d}.mp3"
         
         # Adjust chunk duration for the last chunk
@@ -152,7 +180,8 @@ def chunk_with_ffmpeg(input_path: Path, chunk_duration: int) -> tuple[list[Path]
         cmd = [
             *ffmpeg_cmd, '-y', '-i', str(input_path),
             '-ss', str(start_time), '-t', str(actual_chunk_duration),
-            '-c:a', 'libmp3lame', '-b:a', '128k', str(chunk_path)
+            '-ac', '1', '-ar', '16000', '-c:a', 'libmp3lame', '-b:a', '64k',
+            str(chunk_path)
         ]
         
         logger.info(f"Creating chunk {i+1}/{total_chunks}: {start_time//60}:{start_time%60:02d} - {end_time//60}:{end_time%60:02d}")
@@ -173,6 +202,12 @@ def chunk_with_ffmpeg(input_path: Path, chunk_duration: int) -> tuple[list[Path]
         raise RuntimeError("Failed to create any audio chunks")
     
     logger.info(f"Successfully created {len(chunks)} chunks")
+    
+    # Log chunk sizes for debugging
+    total_size = sum(chunk.stat().st_size for chunk in chunks)
+    avg_size = total_size / len(chunks) if chunks else 0
+    logger.info(f"Total chunk size: {total_size/(1024*1024):.2f} MB, Average: {avg_size/(1024*1024):.2f} MB")
+    
     return chunks, temp_dir
 
 
@@ -183,15 +218,31 @@ def transcribe_to_srt(temp_path: Path) -> str:
     
     logger.info(f"Transcribing file: {temp_path.name} ({size_mb:.2f} MB)")
     
-    with temp_path.open("rb") as f:
-        srt_text = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=f,
-            response_format="srt",
-        )
+    max_retries = 3
+    retry_delay = 2  # seconds
     
-    logger.info(f"Transcription completed for {temp_path.name}")
-    return srt_text  # type: ignore[return-value]
+    for attempt in range(max_retries):
+        try:
+            with temp_path.open("rb") as f:
+                srt_text = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                    response_format="srt",
+                    timeout=300,  # 5 minute timeout per chunk
+                )
+            
+            logger.info(f"Transcription completed for {temp_path.name}")
+            return srt_text  # type: ignore[return-value]
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"Transcription attempt {attempt + 1} failed for {temp_path.name}: {e}")
+                logger.info(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                logger.error(f"All transcription attempts failed for {temp_path.name}: {e}")
+                raise RuntimeError(f"Failed to transcribe {temp_path.name} after {max_retries} attempts: {e}")
 
 
 def transcribe_large_file(input_path: Path) -> str:
@@ -337,6 +388,62 @@ def srt_to_structured_text(srt_text: str) -> str:
     return "\n".join(out_lines).strip() + "\n"
 
 
+def generate_notes_via_chatgpt(transcript_text: str) -> str:
+    """Call OpenAI chat to generate structured lecture notes from transcript text."""
+    if not transcript_text or not transcript_text.strip():
+        raise ValueError("Empty transcript text")
+
+    system_prompt = (
+        "You are the user's note-taking assistant. Your job is to take raw lecture transcripts and convert them into "
+        "clean, skimmable, professional notes that can be pasted directly into Notion.\n\n"
+        "Formatting requirements:\n"
+        "- Use clear H1/H2/H3-style headings and subheadings.\n"
+        "- Use concise bullet points; keep line lengths readable.\n"
+        "- Bold key terms and emphasize essential ideas.\n"
+        "- Include a short overview at the top (Objectives / Executive summary).\n"
+        "- Include a 'Key Takeaways' section.\n"
+        "- Include an 'Action Items' or 'Next Steps' section if applicable.\n"
+        "- Include a short 'Definitions/Glossary' section when terms are introduced.\n"
+        "- Where timestamps like [HH:MM:SS,mmm --> HH:MM:SS,mmm] exist, you may note the starting timestamp at section headers (optional).\n"
+        "- Avoid verbatim transcription; summarize, organize, and de-duplicate.\n"
+        "- Output plain text or Markdown only (Notion-friendly)."
+    )
+
+    user_prompt = (
+        "Create high-quality study notes from this transcript. If timestamps such as [HH:MM:SS,mmm --> HH:MM:SS,mmm] "
+        "are present, you may annotate section headers with the starting time. Keep the notes compact and skimmable.\n\n"
+        f"TRANSCRIPT:\n{transcript_text}"
+    )
+
+    resp = client.chat.completions.create(
+        model=CHATGPT_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.3,
+    )
+
+    return resp.choices[0].message.content or ""
+
+
+@app.post("/api/notes")
+def create_notes():
+    data = request.get_json(silent=True) or {}
+    text = data.get("text", "")
+    try:
+        logger.info("Generating notes via ChatGPT model: %s", CHATGPT_MODEL)
+        notes = generate_notes_via_chatgpt(text)
+        return (
+            notes,
+            200,
+            {"Content-Type": "text/plain; charset=utf-8", "X-Model": CHATGPT_MODEL},
+        )
+    except Exception as e:
+        logger.error("Notes generation failed: %s", str(e), exc_info=True)
+        return jsonify({"error": f"Notes generation failed: {str(e)}"}), 500
+
+
 @app.post("/api/transcribe")
 def upload_and_transcribe():
     """Handle file upload and transcription"""
@@ -361,6 +468,7 @@ def upload_and_transcribe():
     log_request_info(file_size, f.filename)
 
     try:
+        converted_path: Path | None = None
         # Choose transcription method based on file size
         if file_size > MAX_FILE_SIZE:
             if not check_ffmpeg_available():
@@ -372,7 +480,26 @@ def upload_and_transcribe():
             srt_text = transcribe_large_file(tmp_path)
         else:
             logger.info("Using direct transcription for small file")
-            srt_text = transcribe_to_srt(tmp_path)
+            # Check if file is already in a supported compressed format
+            supported_formats = {'.mp3', '.m4a', '.ogg', '.flac', '.aac', '.wma', '.wav', '.webm', '.mpeg', '.mpga'}
+            file_ext = tmp_path.suffix.lower()
+            
+            if file_ext in supported_formats and file_size < MAX_FILE_SIZE:
+                # Send compressed file directly to Whisper (no conversion needed)
+                logger.info(f"File is already in supported format {file_ext}, sending directly to Whisper")
+                srt_text = transcribe_to_srt(tmp_path)
+            else:
+                # Convert to mono 16 kHz WAV for unsupported formats
+                logger.info(f"Converting {file_ext} to mono 16 kHz WAV")
+                try:
+                    converted_path = convert_audio_to_mono_16k(tmp_path)
+                    srt_text = transcribe_to_srt(converted_path)
+                finally:
+                    if converted_path and converted_path.exists():
+                        try:
+                            converted_path.unlink()
+                        except OSError:
+                            pass
         
         # Convert to structured text
         structured = srt_to_structured_text(srt_text)

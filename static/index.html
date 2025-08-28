@@ -8,23 +8,54 @@
 </head>
 <body>
   <div class="container">
-    <h1>WhisperLecture</h1>
-    <p>Drag and drop an audio file below to transcribe. The result will download as a structured .txt file.</p>
-
-    <div id="dropzone" class="dropzone">
-      <span>Drop audio file here or click to select</span>
-      <input id="fileInput" type="file" accept="audio/*" />
+    <div class="header">
+      <div class="brand">WL</div>
+      <h1>WhisperLecture</h1>
     </div>
+    <p class="sub">Transcribe lectures with OpenAI Whisper and instantly turn them into clean, skimmable notes — perfect for pasting into Notion.</p>
 
-    <div id="progress" class="progress" style="display: none;">
-      <div class="progress-bar">
-        <div id="progress-fill" class="progress-fill"></div>
+    <div class="card">
+      <div id="dropzone" class="dropzone">
+        <div class="drop-title">Drop audio here or click to select</div>
+        <div class="drop-hint">Supported: mp3, m4a, wav, mp4, webm, ogg, flac, aac, wma, mkv, opus</div>
+        <input id="fileInput" type="file" accept="audio/*" />
       </div>
-      <div id="progress-text">Processing...</div>
-      <div id="progress-time">Estimating time...</div>
-    </div>
 
-    <div id="status" class="status"></div>
+      <div class="meta" id="fileMeta" style="display:none"></div>
+
+      <div id="progress" class="progress" style="display: none;">
+        <div class="phase"><span id="phase-label">Uploading…</span><span id="percent-label">0%</span></div>
+        <div class="progress-bar">
+          <div id="progress-fill" class="progress-fill"></div>
+        </div>
+        <div id="progress-text" class="progress-text">Preparing…</div>
+        <div id="progress-time" class="progress-time">Estimating time…</div>
+        <div class="actions">
+          <button id="cancelBtn" class="btn">Cancel</button>
+        </div>
+      </div>
+
+      <div class="actions" id="transcriptActions" style="display:none">
+        <button id="downloadTranscriptBtn" class="btn primary">Download Transcript</button>
+        <button id="makeNotesBtn" class="btn">Create Notes with ChatGPT</button>
+        <button id="copyNotesBtn" class="btn" style="display:none">Copy Notes</button>
+      </div>
+
+      <div class="notes-wrap" id="notesWrap" style="display:none">
+        <div class="notes-head">
+          <div class="notes-title">Preview Notes</div>
+          <div class="notes-actions">
+            <button id="copyNotesBtnTop" class="btn">Copy Notes</button>
+          </div>
+        </div>
+        <div class="notes-card">
+          <div class="notes-info">These notes are formatted for Notion. Copy and paste directly.</div>
+          <div id="notesContent" class="notes-content"></div>
+        </div>
+      </div>
+
+      <div id="status" class="status"></div>
+    </div>
   </div>
 
   <script>
@@ -35,124 +66,290 @@
     const progressFill = document.getElementById('progress-fill');
     const progressText = document.getElementById('progress-text');
     const progressTime = document.getElementById('progress-time');
+    const percentLabel = document.getElementById('percent-label');
+    const phaseLabel = document.getElementById('phase-label');
+    const fileMeta = document.getElementById('fileMeta');
+    const cancelBtn = document.getElementById('cancelBtn');
+
+    const transcriptActions = document.getElementById('transcriptActions');
+    const downloadTranscriptBtn = document.getElementById('downloadTranscriptBtn');
+    const makeNotesBtn = document.getElementById('makeNotesBtn');
+    const copyNotesBtn = document.getElementById('copyNotesBtn');
+    const copyNotesBtnTop = document.getElementById('copyNotesBtnTop');
+    const notesWrap = document.getElementById('notesWrap');
+    const notesContent = document.getElementById('notesContent');
+
+    let xhr = null;
+    let estimatedTranscriptionSeconds = null;
+    let lastTranscriptText = null;
+    let lastNotesText = null;
+    let lastUploadedFilename = null;
+    let audioCtx = null;
+
+    // Minimal Markdown renderer for bold, headings, and lists (safe subset)
+    function renderMarkdown(md) {
+      let html = md
+        .replace(/^###\s+(.+)$/gim, '<h3>$1</h3>')
+        .replace(/^##\s+(.+)$/gim, '<h2>$1</h2>')
+        .replace(/^#\s+(.+)$/gim, '<h1>$1</h1>')
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/^-\s+(.+)$/gim, '<li>$1</li>');
+      // Wrap loose <li> into <ul>
+      html = html.replace(/(<li>.*<\/li>)(?!\s*<li>)/gims, '<ul>$1</ul>');
+      html = html.replace(/(<\/li>)\s*(<li>)/gims, '$1$2');
+      html = html.replace(/\n{2,}/g, '<br/><br/>' );
+      return html;
+    }
 
     function setStatus(text, cls = '') {
       status.textContent = text;
       status.className = 'status ' + cls;
     }
 
+    function resetUIState() {
+      // Abort any previous upload
+      if (xhr && xhr.readyState !== XMLHttpRequest.DONE) {
+        try { xhr.abort(); } catch {}
+      }
+      xhr = null;
+      // Close previous audio context if any
+      if (audioCtx && typeof audioCtx.close === 'function') {
+        try { audioCtx.close(); } catch {}
+      }
+      audioCtx = null;
+      // Reset progress and notes UI
+      transcriptActions.style.display = 'none';
+      notesWrap.style.display = 'none';
+      copyNotesBtn.style.display = 'none';
+      copyNotesBtnTop.onclick = null;
+      makeNotesBtn.onclick = null;
+      downloadTranscriptBtn.onclick = null;
+      lastTranscriptText = null;
+      lastNotesText = null;
+      lastUploadedFilename = null;
+      setStatus('', '');
+    }
+
     function showProgress() {
       progress.style.display = 'block';
       progressFill.style.width = '0%';
-      progressText.textContent = 'Uploading and transcribing...';
-      progressTime.textContent = 'Estimating time...';
+      progressText.textContent = 'Preparing…';
+      progressTime.textContent = 'Estimating time…';
+      percentLabel.textContent = '0%';
+      phaseLabel.textContent = 'Uploading…';
     }
 
     function updateProgress(percent, text, timeText) {
-      progressFill.style.width = percent + '%';
+      const pct = Math.max(0, Math.min(100, Math.round(percent)));
+      progressFill.style.width = pct + '%';
+      percentLabel.textContent = pct + '%';
       if (text) progressText.textContent = text;
       if (timeText) progressTime.textContent = timeText;
     }
 
-    function hideProgress() {
-      progress.style.display = 'none';
-    }
+    function hideProgress() { progress.style.display = 'none'; }
 
     function formatFileSize(bytes) {
       if (bytes === 0) return '0 Bytes';
-      const k = 1024;
-      const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+      const k = 1024; const sizes = ['Bytes', 'KB', 'MB', 'GB'];
       const i = Math.floor(Math.log(bytes) / Math.log(k));
       return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
     }
 
-    function estimateTime(fileSize) {
-      // Rough estimate: 1MB = ~30 seconds for transcription
-      const mb = fileSize / (1024 * 1024);
-      const seconds = Math.round(mb * 30);
-      if (seconds < 60) return `${seconds} seconds`;
-      const minutes = Math.round(seconds / 60);
-      return `${minutes} minutes`;
+    async function probeAudioDuration(file) {
+      // Try HTMLAudioElement first (fast/robust)
+      try {
+        const url = URL.createObjectURL(file);
+        const audio = new Audio();
+        const duration = await new Promise((resolve, reject) => {
+          const cleanup = () => { try { URL.revokeObjectURL(url); } catch {} };
+          audio.preload = 'metadata';
+          audio.onloadedmetadata = () => { const d = audio.duration; cleanup(); resolve(isFinite(d) ? d : null); };
+          audio.onerror = () => { cleanup(); resolve(null); };
+          audio.src = url;
+        });
+        if (duration && duration > 0 && isFinite(duration)) return duration;
+      } catch {}
+
+      // Fallback: Web Audio API decode
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+        const d = audioBuffer.duration;
+        // Close to free resources
+        try { audioCtx.close(); } catch {}
+        audioCtx = null;
+        return d;
+      } catch { return null; }
     }
 
-    function upload(file) {
-      if (!file) return;
-      
-      const fileSize = file.size;
-      const sizeText = formatFileSize(fileSize);
-      const timeEstimate = estimateTime(fileSize);
-      
-      showProgress();
-      setStatus(`File: ${file.name} (${sizeText}) - Estimated time: ${timeEstimate}`, 'working');
-      
-      const form = new FormData();
-      form.append('file', file);
+    function formatEta(seconds) {
+      if (seconds == null) return 'Estimating time…';
+      const mins = Math.floor(seconds / 60);
+      const secs = Math.max(0, Math.round(seconds % 60));
+      if (mins <= 0) return secs + 's remaining';
+      return mins + 'm ' + secs + 's remaining';
+    }
 
-      // Simulate progress for upload phase
-      let uploadProgress = 0;
-      const uploadInterval = setInterval(() => {
-        uploadProgress += Math.random() * 15;
-        if (uploadProgress > 90) uploadProgress = 90;
-        updateProgress(uploadProgress, 'Uploading...', `Estimated transcription time: ${timeEstimate}`);
-      }, 200);
+    function estimateTranscriptionTime(durationSec, fileSize) {
+      // Heuristic tuned: base on duration; add chunk overhead if size > 25MB
+      const mb = fileSize / (1024 * 1024);
+      const CHUNK_LIMIT_MB = 25;
+      const CHUNK_SECONDS = 600;
+      const BASE_SPEED = 0.8; // 0.8x real-time (faster than realtime)
+      const PER_CHUNK_OVERHEAD = 12; // seconds
 
-      fetch('/api/transcribe', {
-        method: 'POST',
-        body: form,
-      }).then(async (res) => {
-        clearInterval(uploadInterval);
-        updateProgress(95, 'Transcribing with Whisper...', 'Almost done...');
-        
-        if (!res.ok) {
-          const txt = await res.text();
-          throw new Error(txt || 'Server error');
-        }
-        return res.blob();
-      }).then((blob) => {
-        updateProgress(100, 'Downloading transcript...', 'Complete!');
-        
+      if (durationSec && isFinite(durationSec)) {
+        const chunks = Math.max(1, Math.ceil(durationSec / CHUNK_SECONDS));
+        const overhead = mb > CHUNK_LIMIT_MB ? chunks * PER_CHUNK_OVERHEAD : 0;
+        const estimate = durationSec * BASE_SPEED + overhead;
+        return Math.max(25, Math.min(20 * 60, Math.round(estimate)));
+      }
+      // No duration: fall back to size-based estimate
+      const sizeBased = mb * 22; // seconds per MB
+      return Math.max(30, Math.min(20 * 60, Math.round(sizeBased)));
+    }
+
+    function copyToClipboard(text) {
+      navigator.clipboard.writeText(text).then(() => {
+        setStatus('Notes copied to clipboard. Paste directly into Notion.', 'ok');
+      }).catch(() => setStatus('Copy failed. Select and copy manually.', 'error'));
+    }
+
+    function triggerTranscriptFlow(text, originalFilename) {
+      transcriptActions.style.display = 'flex';
+      lastTranscriptText = text;
+      downloadTranscriptBtn.disabled = false;
+      makeNotesBtn.disabled = false;
+      copyNotesBtn.style.display = 'none';
+      notesWrap.style.display = 'none';
+
+      // Set up download button with original filename
+      downloadTranscriptBtn.onclick = () => {
+        const blob = new Blob([text], { type: 'text/plain' });
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        const name = (file.name.replace(/\.[^.]+$/, '') || 'transcript') + '_transcript.txt';
-        a.download = name;
+        // Use original filename without extension + "_transcript.txt"
+        const filenameWithoutExt = originalFilename.replace(/\.[^/.]+$/, "");
+        a.download = `${filenameWithoutExt}_transcript.txt`;
         document.body.appendChild(a);
         a.click();
         a.remove();
         window.URL.revokeObjectURL(url);
-        
-        setStatus('Done. Transcript downloaded.', 'ok');
-        hideProgress();
-      }).catch((err) => {
-        clearInterval(uploadInterval);
-        console.error(err);
-        setStatus('Error: ' + err.message, 'error');
-        hideProgress();
-      });
+        setStatus('Transcript downloaded successfully!', 'ok');
+      };
+
+      makeNotesBtn.onclick = async () => {
+        makeNotesBtn.disabled = true;
+        makeNotesBtn.textContent = 'Creating Notes…';
+        try {
+          const res = await fetch('/api/notes', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text })
+          });
+          if (!res.ok) throw new Error(await res.text());
+          const notes = await res.text();
+          lastNotesText = notes;
+
+          notesContent.innerHTML = renderMarkdown(notes);
+          notesWrap.style.display = 'block';
+          copyNotesBtn.style.display = 'inline-block';
+          copyNotesBtn.onclick = () => copyToClipboard(notes);
+          copyNotesBtnTop.onclick = () => copyToClipboard(notes);
+          setStatus('Notes ready. Click Copy to paste into Notion.', 'ok');
+        } catch (e) {
+          console.error(e);
+          setStatus('Failed to create notes: ' + e.message, 'error');
+        } finally {
+          makeNotesBtn.disabled = false;
+          makeNotesBtn.textContent = 'Create Notes with ChatGPT';
+        }
+      };
+    }
+
+    function uploadWithProgress(file) {
+      const form = new FormData();
+      form.append('file', file);
+
+      xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/transcribe');
+
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          const percent = (e.loaded / e.total) * 100 * 0.7; // upload ~70%
+          updateProgress(percent, 'Uploading…', '');
+        }
+      };
+
+      xhr.onreadystatechange = () => {
+        if (xhr.readyState === XMLHttpRequest.HEADERS_RECEIVED) {
+          phaseLabel.textContent = 'Transcribing…';
+          updateProgress(70, 'Transcribing with Whisper…', formatEta(estimatedTranscriptionSeconds));
+        }
+      };
+
+      xhr.onload = async () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          updateProgress(100, 'Finalizing…', 'Complete');
+          const transcriptText = xhr.responseText;
+          triggerTranscriptFlow(transcriptText, lastUploadedFilename);
+          setStatus('Transcript ready! Download or create notes.', 'ok');
+          hideProgress();
+        } else {
+          console.error(xhr.responseText);
+          setStatus('Error: ' + (xhr.responseText || ('HTTP ' + xhr.status)), 'error');
+          hideProgress();
+        }
+      };
+
+      xhr.onerror = () => { setStatus('Network error during upload.', 'error'); hideProgress(); };
+      xhr.onabort = () => { setStatus('Upload cancelled.', ''); hideProgress(); };
+
+      xhr.responseType = 'text';
+      xhr.send(form);
+
+      cancelBtn.onclick = () => {
+        try { if (xhr) xhr.abort(); } catch {}
+      };
+    }
+
+    async function handleFile(file) {
+      if (!file) return;
+      resetUIState();
+
+      const fileSize = file.size;
+      const sizeText = formatFileSize(fileSize);
+      lastUploadedFilename = file.name; // Store filename for download
+      fileMeta.style.display = 'block';
+      fileMeta.textContent = `File: ${file.name} • ${sizeText}`;
+
+      showProgress();
+      const duration = await probeAudioDuration(file);
+      estimatedTranscriptionSeconds = estimateTranscriptionTime(duration, fileSize);
+      updateProgress(2, 'Preparing…', formatEta(estimatedTranscriptionSeconds));
+
+      uploadWithProgress(file);
+
+      const etaTimer = setInterval(() => {
+        const currentText = phaseLabel.textContent || '';
+        if (currentText.includes('Transcribing')) {
+          if (estimatedTranscriptionSeconds && estimatedTranscriptionSeconds > 0) {
+            estimatedTranscriptionSeconds -= 1;
+            progressTime.textContent = formatEta(estimatedTranscriptionSeconds);
+          }
+        } else if (progress.style.display === 'none') {
+          clearInterval(etaTimer);
+        }
+      }, 1000);
     }
 
     dropzone.addEventListener('click', () => fileInput.click());
-
-    dropzone.addEventListener('dragover', (e) => {
-      e.preventDefault();
-      dropzone.classList.add('hover');
-    });
-
-    dropzone.addEventListener('dragleave', () => {
-      dropzone.classList.remove('hover');
-    });
-
-    dropzone.addEventListener('drop', (e) => {
-      e.preventDefault();
-      dropzone.classList.remove('hover');
-      const file = e.dataTransfer.files[0];
-      upload(file);
-    });
-
-    fileInput.addEventListener('change', () => {
-      const file = fileInput.files[0];
-      upload(file);
-    });
+    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('hover'); });
+    dropzone.addEventListener('dragleave', () => { dropzone.classList.remove('hover'); });
+    dropzone.addEventListener('drop', (e) => { e.preventDefault(); dropzone.classList.remove('hover'); const file = e.dataTransfer.files[0]; handleFile(file); });
+    fileInput.addEventListener('change', () => { const file = fileInput.files[0]; handleFile(file); });
   </script>
 </body>
 </html>
