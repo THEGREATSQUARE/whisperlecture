@@ -44,13 +44,13 @@ def transcribe_file(client: OpenAI, input_path: Path, fmt: str) -> str:
     with input_path.open("rb") as f:
         if fmt == "text":
             resp = client.audio.transcriptions.create(
-                model="whisper-1",
+                model="faster-whisper",
                 file=f,
             )
             return resp.text  # type: ignore[attr-defined]
         else:
             resp = client.audio.transcriptions.create(
-                model="whisper-1",
+                model="faster-whisper",
                 file=f,
                 response_format=fmt,
             )

@@ -27,6 +27,25 @@ app = Flask(__name__)
 
 load_dotenv()
 client = OpenAI()
+# Local faster-whisper toggle
+LOCAL_WHISPER_ENABLED = os.getenv("USE_LOCAL_WHISPER", "0").lower() in ("1", "true", "yes")
+LOCAL_MODEL = os.getenv("LOCAL_MODEL", "small.en")
+LOCAL_COMPUTE = os.getenv("LOCAL_COMPUTE", "int8")
+# VAD configuration (applies only to local faster-whisper)
+VAD_FILTER_ENABLED = os.getenv("VAD_FILTER", "0").lower() in ("1", "true", "yes")
+VAD_MIN_SILENCE_MS = int(os.getenv("VAD_MIN_SILENCE_MS", "200"))
+VAD_MIN_SPEECH_MS = int(os.getenv("VAD_MIN_SPEECH_MS", "100"))
+VAD_SPEECH_PAD_MS = int(os.getenv("VAD_SPEECH_PAD_MS", "200"))
+VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.5"))
+local_model = None
+if LOCAL_WHISPER_ENABLED:
+    try:
+        from faster_whisper import WhisperModel  # type: ignore
+        local_model = WhisperModel(LOCAL_MODEL, device="cpu", compute_type=LOCAL_COMPUTE)
+        logger.info(f"Local faster-whisper enabled: model={LOCAL_MODEL}, compute={LOCAL_COMPUTE}")
+    except Exception as e:
+        logger.error(f"Failed to initialize faster-whisper: {e}")
+        LOCAL_WHISPER_ENABLED = False
 
 # OpenAI Whisper API limits
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB
@@ -211,16 +230,80 @@ def chunk_with_ffmpeg(input_path: Path, chunk_duration: int) -> tuple[list[Path]
     return chunks, temp_dir
 
 
+def _sec_to_srt_ts(t: float) -> str:
+    if t < 0:
+        t = 0
+    h = int(t // 3600)
+    m = int((t % 3600) // 60)
+    s = int(t % 60)
+    ms = int(round((t - int(t)) * 1000))
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def local_transcribe_to_srt(audio_path: Path) -> str:
+    if local_model is None:
+        raise RuntimeError("Local model not initialized")
+    logger.info(f"Local transcription (faster-whisper): {audio_path.name}")
+    if VAD_FILTER_ENABLED:
+        logger.info(
+            "Using VAD filter with params: min_silence=%dms, min_speech=%dms, pad=%dms, threshold=%.2f",
+            VAD_MIN_SILENCE_MS,
+            VAD_MIN_SPEECH_MS,
+            VAD_SPEECH_PAD_MS,
+            VAD_THRESHOLD,
+        )
+        segments, info = local_model.transcribe(
+            str(audio_path),
+            vad_filter=True,
+            vad_parameters=dict(
+                min_silence_duration_ms=VAD_MIN_SILENCE_MS,
+                min_speech_duration_ms=VAD_MIN_SPEECH_MS,
+                speech_pad_ms=VAD_SPEECH_PAD_MS,
+                threshold=VAD_THRESHOLD,
+            ),
+            beam_size=1,
+            best_of=1,
+        )
+    else:
+        logger.info("VAD filter disabled (set VAD_FILTER=1 to enable)")
+        segments, info = local_model.transcribe(
+            str(audio_path),
+            vad_filter=False,
+            beam_size=1,
+            best_of=1,
+        )
+    lines: list[str] = []
+    idx = 1
+    for seg in segments:
+        start = float(getattr(seg, 'start', 0.0) or 0.0)
+        end = float(getattr(seg, 'end', start + 0.01) or (start + 0.01))
+        text = (getattr(seg, 'text', '') or '').strip()
+        if not text:
+            continue
+        lines.append(str(idx))
+        lines.append(f"{_sec_to_srt_ts(start)} --> { _sec_to_srt_ts(end)}")
+        lines.append(text)
+        lines.append("")
+        idx += 1
+    srt = "\n".join(lines).strip() + "\n"
+    logger.info(f"Local transcription finished: {audio_path.name}")
+    return srt
+
+
 def transcribe_to_srt(temp_path: Path) -> str:
     """Transcribe a single audio file to SRT format"""
     file_size = temp_path.stat().st_size
     size_mb = file_size / (1024 * 1024)
-    
+
     logger.info(f"Transcribing file: {temp_path.name} ({size_mb:.2f} MB)")
-    
+
+    # Prefer local faster-whisper when enabled
+    if LOCAL_WHISPER_ENABLED:
+        return local_transcribe_to_srt(temp_path)
+
     max_retries = 3
     retry_delay = 2  # seconds
-    
+
     for attempt in range(max_retries):
         try:
             with temp_path.open("rb") as f:
@@ -230,10 +313,10 @@ def transcribe_to_srt(temp_path: Path) -> str:
                     response_format="srt",
                     timeout=300,  # 5 minute timeout per chunk
                 )
-            
+
             logger.info(f"Transcription completed for {temp_path.name}")
             return srt_text  # type: ignore[return-value]
-            
+
         except Exception as e:
             if attempt < max_retries - 1:
                 logger.warning(f"Transcription attempt {attempt + 1} failed for {temp_path.name}: {e}")
