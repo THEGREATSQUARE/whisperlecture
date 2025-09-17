@@ -1,4 +1,4 @@
-### WhisperLecture — Fast, local lecture transcription (API optional)
+### WhisperAudio — Fast, local lecture transcription (API optional)
 
 **What this is**: A simple tool with a drag‑and‑drop web UI to transcribe audio into clean text (`.txt`, `.srt`, `.vtt`). It prioritizes running locally with `faster-whisper` for speed, quality, privacy, and reliability. An OpenAI API fallback is available but not recommended.
 
